@@ -644,6 +644,7 @@ static int pl_disp(SvcObj* o, IpcCtx* c){
   static KShmem* shm; extern KShmem* kshmem_new(u64,const char*); extern u8* kshmem_ptr(KShmem*);
   if(!shm){ shm=kshmem_new(0x1100000,"font"); kobj_ref(&shm->o); fonts_fill(kshmem_ptr(shm),0x1100000); }
   u32 id=in32(c,0); if(id>5) id=0;
+  LOG("pl: cmd=%u font=%u\n", c->cmd, id);
   switch(c->cmd){
     case 0: return 0;                                                       /* RequestLoad */
     case 1: out32(c,1); return 0;                                           /* GetLoadState: loaded */

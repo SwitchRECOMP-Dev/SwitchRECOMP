@@ -102,15 +102,24 @@ static void th_destroy(KObj* o){ (void)o; /* thread objects are never freed */ }
 
 static u64 alloc_tls(void){ u64 a=kmem_alloc(0x1000,MS_TLS,PERM_RW); memset(GP(a),0,0x1000); return a; }
 
-KThread* kthread_create(u64 entry, u64 arg, u64 stack_top, int prio, int core){
+KThread* kthread_create(u64 entry, u64 arg, u64 stack_top, int prio, int core, u64 threadtype){
   KThread* t=calloc(1,sizeof *t);
+  t->threadtype=threadtype;
   t->o.type=KO_THREAD; t->o.is_signaled=th_sig; t->o.destroy=th_destroy; t->o.name="thread";
   t->entry=entry; t->arg=arg; t->stack_top=stack_top; t->prio=prio; t->core=core<0? 0 : core; t->ideal=t->core; t->affinity=1ull<<t->core;
   t->tls=alloc_tls(); pc_init(&t->cv);
   pm_lock(&g_klock); t->id=g_next_tid++; if(g_nthreads<256) g_threads[g_nthreads++]=t; pm_unlock(&g_klock);
   CPU* c=&t->cpu; memset(c,0,sizeof *c);
   c->mem=g_mem; c->disp=g_disp; c->code_lo=g_code_lo; c->code_hi=g_code_hi; c->rt=&g_rtapi; c->thread=t;
-  c->tpidrro=t->tls; c->x[0]=arg; c->x[31]=stack_top; c->pc=entry;
+  c->tpidr=t->tls; c->tpidrro=t->tls; c->x[0]=arg; c->x[31]=stack_top; c->pc=entry;
+  /* T13 D1 ROOT FIX: HOS links the game's ThreadType into the thread TLS at offset 504 —
+     GetTlsValue reads *( *(TLS+504) + slot*8 + 128 ). The runtime used to DROP the ThreadType the
+     game passes to svcCreateThread (x0!) so *(TLS+504)=0 forever → GetTlsValue garbage → the Mii
+     0x210-stride object stays unconstructed → helper 9129d84 faults at [0+0*8-8] = -8 (the crash
+     signature, timing-dependent). Link it now. */
+  if(threadtype){ u8* tl=GP(t->tls); if(tl) memcpy(tl+504,&threadtype,8);
+    LOG("tpidrdbg: linked ThreadType %llx -> tls %llu (+504)\n",(unsigned long long)threadtype,(unsigned long long)t->id); }
+  LOG("tpidrdbg: create tid=%llu tls=%llx entry=%llx tt=%llx\n",(unsigned long long)t->id,(unsigned long long)t->tls,(unsigned long long)entry,(unsigned long long)threadtype);
   return t;
 }
 
@@ -149,7 +158,7 @@ void kernel_run_main(u64 entry, u64 stack_size, int prio, int core){
   stack_size=(stack_size+0xFFF)&~0xFFFull;
   u64 st=mem_find_free(STACK_BASE,STACK_BASE+STACK_SIZE,stack_size+0x2000,0x1000)+0x1000;
   mem_map(st,stack_size,MS_STACK,PERM_RW);
-  KThread* t=kthread_create(entry,0,st+stack_size,prio,core);
+  KThread* t=kthread_create(entry,0,st+stack_size,prio,core,0);   /* main: el juego setea su propio ThreadType */
   t->is_main=1; g_main=t; strcpy(t->name,"main");
   u32 h=h_new(&t->o); t->cpu.x[1]=h;
   kthread_start(t);
@@ -702,7 +711,7 @@ static void swr_svc_(CPU* c, u32 imm){
   case 0x08: {
     int prio=(int)(u32)x[4], core=(int)(i32)(u32)x[5];
     if(core==-2) core=default_core();
-    KThread* n=kthread_create(x[1],x[2],x[3],prio,core);
+    KThread* n=kthread_create(x[1],x[2],x[3],prio,core,x[0]);   /* T13: x0 = el ThreadType del juego! */
     u32 h=h_new(&n->o); x[0]=0; x[1]=h;
     LOGV("CreateThread entry=%llx stack=%llx prio=%d core=%d -> %x\n",(unsigned long long)x[1],(unsigned long long)n->stack_top,prio,core,h);
     return; }
