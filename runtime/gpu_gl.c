@@ -333,6 +333,7 @@ static void astc_rows(void* c, u32 a, u32 b){ DecJob* j=c; astc_decode_rows(j->s
 static void bc_rows(void* c, u32 a, u32 b){ DecJob* j=c; u32 bx=(j->w+3)/4; u32 y0=a*4, y1=b*4; if(y1>j->h) y1=j->h; if(y0>=y1) return;
   swr_bc_decode((int)j->kind,j->src+(u64)a*bx*j->bsz,j->w,y1-y0,(u32*)(j->dst+(u64)y0*j->w*4)); }
 
+static int g_fb_sig_ok;   /* forward (defined at line ~516): tex_upload resets it when dropping a derived view */
 static void tex_upload(Tex* t){ st_tex_up+=t->size;
   if(tex_zero_height_fix(t)) return;
   const GlFmt* f=&t->f;
@@ -396,6 +397,10 @@ static void tex_upload(Tex* t){ st_tex_up+=t->size;
       off+= t->bl? lsz : (u64)t->pitch*th;
     }
   }
+  /* view freshness: t->view (the 2D->2D_ARRAY copy fallback) is derived data — a re-upload from
+     guest memory (glyph tiles rasterized later, typewriter dialogs) leaves it stale and those tiles
+     stay blank in the copy. Drop it so the next bind rebuilds it. */
+  if(t->view){ glDeleteTextures(1,&t->view); t->view=0; g_fb_sig_ok=0; }
 }
 
 static u32 g_tex_bud_frame; static i64 g_tex_bud; static u64 st_tex_chk;
@@ -411,9 +416,16 @@ static u64 fast_hash(const u8* p, u64 size, int sampled){
 static u64 sample_hash(u64 gva, u64 len); static int g_nosample;
 
 static u64 mem_hash(u64 gva, u64 size){
-  /* quick sample: one word per 64 bytes + the first 4K */
-  u64 h=1469598103934665603ull; u8* p=gmem_ptr(gva,size);
-  if(p) return fast_hash(p,size,1);
+  /* quick sample: one word per 64 bytes + the first 4K.
+     T9: FULL hash for textures up to 32MB — the sampled variants (1 word per 128 bytes here,
+     64 bytes per 4096 in the fallback below) are blind to glyph-tile writes outside the sample grid, so
+     tiles rasterized into the font sheet were lost guest->GL forever (K/M/L holes, verified by atlas dump
+     20-nov: tile p3(17,27) 160k ink in guest, 0 in GL, never re-uploaded). The cost is only paid right
+     after an upload (stable<4) and on change events; steady state keeps the cheap sampled check. */
+  u64 h=1469598103934665603ull; int full= size<=(32ull<<20);
+  u8* p=gmem_ptr(gva,size);
+  if(p) return fast_hash(p,size, full? 0 : 1);
+  if(full){ u8* b=malloc(size? size : 1); if(b){ gmem_read(gva,b,size); u64 hh=fast_hash(b,size,0); free(b); return hh; } }
   for(u64 o=0;o<size;o+=4096){ u64 v[8]; gmem_read(gva+o,v,size-o<64? size-o : 64); for(int i=0;i<8;i++){ h^=v[i]; h*=1099511628211ull; } }
   return h; }
 
@@ -1999,8 +2011,54 @@ static void mb_init(void){
 /* sampler type mismatch (2D vs array, cube vs array): use a texture view */
 static PFNGLTEXTUREVIEWPROC p_tview; static u64 st_tex_view;
 
+/* T8  atlas forensics: SWR_ATLASDUMP=<frame> dumps, on the first mismatch-bind of a big
+   texture at/after that frame: (1) the guest source memory deswizzled, (2) the GL texture,
+   (3) the derived view copy. Three PPMs in captures/: atlas_guest / atlas_gl_flat / atlas_gl_view.
+   The flat and the view have the same texel count (pages are a re-slice), so the view dump stacks
+   its layers as one WxH image = directly comparable. */
+static int tr_teximage(GLenum tg, GLenum fmt, GLenum type, size_t cap, void* px);
+static void atlas_dump(Tex* t){
+  static int did, thr=-2;
+  if(thr==-2){ const char* e=getenv("SWR_ATLASDUMP"); thr= e? atoi(e) : -1; }
+  if(thr<0 || did || !t || t->w<1024 || (int)g_frame<thr) return;
+  did=1;
+  const GlFmt* f=&t->f;
+  u32 tw=(t->w+f->bw-1)/f->bw, th=(t->h+f->bh-1)/f->bh; u32 rowb=tw*f->bpp;
+  u32 lbh=0;
+  u64 lsz= t->bl? bl_level_size(t->w,t->h,1,f,t->bh,t->bd,0,&lbh) : (u64)t->pitch*th;
+  u8* src=malloc(lsz? lsz : 1); u8* lin=malloc((size_t)rowb*th? (size_t)rowb*th : 1);
+  if(src && lin){
+    gmem_read(t->gva,src,lsz);
+    if(t->bl){ DsJob dj={lin,src,lsz,rowb,th,lbh,0}; ds_rows(&dj,0,th); }
+    else { for(u32 y=0;y<th;y++) memcpy(lin+(u64)y*rowb,src+(u64)y*t->pitch,rowb); }
+    FILE* fo=fopen("captures/atlas_guest.ppm","wb");
+    if(fo){ fprintf(fo,"P6\n%u %u\n255\n",t->w,t->h);
+      u32 bpp= f->bpp? f->bpp : 1, chan= (!f->compressed && bpp>=4)? 3u : 0u;
+      for(u64 y=0;y<t->h;y++) for(u64 x=0;x<t->w;x++){ u64 o=y*rowb+x*bpp; u8 g= (o<(u64)rowb*th)? lin[o+chan] : 0;
+        fwrite(&g,1,1,fo); fwrite(&g,1,1,fo); fwrite(&g,1,1,fo); }
+      fclose(fo); LOG("atlasdump: guest %llx (bl=%u bpp=%u rowb=%u) -> captures/atlas_guest.ppm\n",(unsigned long long)t->gva,t->bl,f->bpp,rowb); }
+  }
+  free(src); free(lin);
+  u64 npx=(u64)t->w*t->h;
+  u8* px=malloc((size_t)npx*4+64);
+  if(px){
+    glBindTexture(t->target,t->id); glPixelStorei(GL_PACK_ALIGNMENT,1);
+    if(tr_teximage(t->target,GL_RGBA,GL_UNSIGNED_BYTE,(size_t)npx*4,px)){
+      FILE* fo=fopen("captures/atlas_gl_flat.ppm","wb");
+      if(fo){ fprintf(fo,"P6\n%u %u\n255\n",t->w,t->h); for(u64 k=0;k<npx;k++) fwrite(px+k*4,1,3,fo); fclose(fo);
+        LOG("atlasdump: gl flat -> captures/atlas_gl_flat.ppm\n"); } }
+    if(t->view){ glBindTexture(GL_TEXTURE_2D_ARRAY,t->view);
+      memset(px,0,(size_t)npx*4);
+      if(tr_teximage(GL_TEXTURE_2D_ARRAY,GL_RGBA,GL_UNSIGNED_BYTE,(size_t)npx*4,px)){
+        FILE* fo=fopen("captures/atlas_gl_view.ppm","wb");
+        if(fo){ fprintf(fo,"P6\n%u %u\n255\n",t->w,t->h); for(u64 k=0;k<npx;k++) fwrite(px+k*4,1,3,fo); fclose(fo);
+        LOG("atlasdump: gl view (layers stacked) -> captures/atlas_gl_view.ppm\n"); } } }
+    free(px); }
+}
+
 static GLuint tex_view(Tex* t, GLenum want){
   if(!p_tview || !t) return 0;
+  atlas_dump(t);
   if(t->view && t->view_target==want) return t->view;
   GLenum a=t->target; u32 layers= a==GL_TEXTURE_2D? 1 : a==GL_TEXTURE_CUBE_MAP? 6 : t->d; u32 nl;
   int ok2d= a==GL_TEXTURE_2D||a==GL_TEXTURE_2D_ARRAY||a==GL_TEXTURE_CUBE_MAP||a==GL_TEXTURE_CUBE_MAP_ARRAY;
@@ -2012,7 +2070,51 @@ static GLuint tex_view(Tex* t, GLenum want){
   if(t->f.fmt==0 && !t->f.compressed) return 0;
   if(t->view){ glDeleteTextures(1,&t->view); t->view=0; g_fb_sig_ok=0; }
   GLuint v=0; glGenTextures(1,&v); p_tview(v,want,t->id,t->f.ifmt,0,t->levels,0,nl);
-  if(glGetError()!=GL_NO_ERROR){ glDeleteTextures(1,&v); return 0; }
+  GLenum v_err=glGetError();
+  if(v_err!=GL_NO_ERROR){
+    glDeleteTextures(1,&v); v=0;
+    /* fallback : some drivers reject 2D->2D_ARRAY views; build a real 2D_ARRAY and copy the pixels (always legal) */
+    if(a==GL_TEXTURE_2D && want==GL_TEXTURE_2D_ARRAY && t->f.ifmt && !t->f.compressed && p_cis){
+      static int said; int ncpy=0;
+      int lvl= t->levels>=1? (int)t->levels : 1;
+      /* T7 pages : a flat 2D WxH texture sampled as a 2D_ARRAY indexes N stacked square pages
+         (N=H/W; the shader layer comes from a register: traces GLSL `texture(tex,vec3(uv,float(rN)))`)
+         so the copy MUST keep the page geometry (layer k = rows [k*W,(k+1)*W) of the flat texture) and
+         the mips per page, or every page!=0 reads blank / wrong.
+         T10 (, ablacion 21-nov): DEFAULT = FLAT 1-layer copy — the pages geometry kills the title
+         prompt run "Press <L>+<R> to Start" (badge-bearing instanced run) entirely while text elsewhere
+         renders the same in both modes (3F A/B), and the flat copy does NOT mutilate anything (the T6-3B
+         mutilation was its 1-mip-only copy). SWR_VIEW_PAGES=1 re-enables the page geometry for A/B. */
+      static int pages_on=-2; if(pages_on==-2){ const char* e=getenv("SWR_VIEW_PAGES"); pages_on= (e && e[0]=='1'); }
+      u32 np= (pages_on && t->h>t->w && (t->h%t->w)==0 && t->h/t->w<=256)? t->h/t->w : 1;
+      u32 pw=t->w, ph= np>1? t->w : t->h;
+      glGenTextures(1,&v); glBindTexture(GL_TEXTURE_2D_ARRAY,v);
+      glTexStorage3D(GL_TEXTURE_2D_ARRAY,lvl,t->f.ifmt,pw,ph,np);
+      if(glGetError()!=GL_NO_ERROR){ glDeleteTextures(1,&v); v=0; }
+      else for(int l=0;l<lvl;l++){
+        int w2= pw>>l? pw>>l : 1, h2= ph>>l? ph>>l : 1;
+        int ok_l=1;
+        for(u32 k=0;k<np && ok_l;k++){
+          int sy=(int)k*h2;
+          /* level 0 is always a bit-exact copy (legal in every driver); higher levels respect the selftest */
+          if(l>0 && g_lvl_mode && np==1) lvl_blit(t->id,GL_TEXTURE_2D,l,0,w2,h2, v,GL_TEXTURE_2D_ARRAY,l,0,w2,h2,GL_NEAREST);
+          else p_cis(t->id,GL_TEXTURE_2D,l,0,sy,0, v,GL_TEXTURE_2D_ARRAY,l,0,0,(int)k,w2,h2,1);
+          if(glGetError()!=GL_NO_ERROR) ok_l=0;
+        }
+        if(ok_l){ ncpy++; continue; }
+        /* a level that fails to copy reverts the texture to the 1-mip copy this fallback had before */
+        LOG("gpu: view fallback: level %d/%d copy failed: back to 1-mip\n",l,lvl);
+        glDeleteTextures(1,&v); v=0;
+        glGenTextures(1,&v); glBindTexture(GL_TEXTURE_2D_ARRAY,v);
+        glTexStorage3D(GL_TEXTURE_2D_ARRAY,1,t->f.ifmt,t->w,t->h,1);
+        p_cis(t->id,GL_TEXTURE_2D,0,0,0,0, v,GL_TEXTURE_2D_ARRAY,0,0,0,0,t->w,t->h,1);
+        if(glGetError()!=GL_NO_ERROR){ glDeleteTextures(1,&v); v=0; } else { nl=1; np=1; }
+        break;
+      }
+      if(v && ncpy==lvl){ nl=lvl; if(said<4){ said++; LOG("gpu: view 2D->2D_ARRAY rejected (err %x): using copy fallback (%d mips, %u pages)\n",v_err,lvl,np); } }
+    }
+    if(!v) return 0;
+  }
   t->view=v; t->view_target=want; st_tex_view++;
   t->vswz[0]=GL_RED; t->vswz[1]=GL_GREEN; t->vswz[2]=GL_BLUE; t->vswz[3]=GL_ALPHA;
   return v; }

@@ -306,7 +306,7 @@ def build_runtime(cc, out, target_win, backend, say, opt='2'):
         # static on Linux too, so the runtime doesn't depend on the libstdc++ version of the distro
         cmd += ['-lstdc++'] if target_win else ['-Wl,-Bstatic', '-lstdc++', '-Wl,-Bdynamic', '-static-libgcc']
     if target_win:
-        cmd += ['-static', '-lgdi32', '-lwinmm', '-luser32', '-lopengl32', '-lcomdlg32', '-lshell32', '-mwindows' if backend == 'win32' else '-mconsole']
+        cmd += ['-static', '-lgdi32', '-lwinmm', '-luser32', '-lopengl32', '-lcomdlg32', '-lshell32', '-lmsvcrt', '-mwindows' if backend == 'win32' else '-mconsole']
         if backend == 'win32': cmd += ['-lmfplat', '-lmfreadwrite', '-lmfuuid', '-lole32']
     else:
         cmd += ['-lpthread', '-ldl', '-lm', '-rdynamic']

@@ -160,7 +160,7 @@ struct KThread {
   KObj o;
   CPU cpu;
   u64 id; int prio, core, ideal; u64 affinity;   /* core: where it runs; ideal: -1 when it has none */
-  u64 tls; u64 entry, arg, stack_top;
+  u64 tls; u64 threadtype;   /* T13 */ u64 entry, arg, stack_top;
   int state;                   /* 0 created, 1 running, 2 exited */
   PCond cv;
   int woken, cancel, suspended;
@@ -194,7 +194,8 @@ void   kevent_signal(KEvent* e);
 void   kevent_clear(KEvent* e);
 void   kobj_signal(KObj* o);           /* wakes waiters */
 KThread* kthread_cur(void);
-KThread* kthread_create(u64 entry, u64 arg, u64 stack_top, int prio, int core);
+KThread* kthread_create(u64 entry, u64 arg, u64 stack_top, int prio, int core, u64 threadtype);
+/* T13: el ThreadType del juego enlazado en TLS+504 */
 void   kthread_start(KThread* t);
 void   kernel_run_main(u64 entry, u64 stack_size, int prio, int core);
 void   swr_svc(CPU* c, u32 imm);
