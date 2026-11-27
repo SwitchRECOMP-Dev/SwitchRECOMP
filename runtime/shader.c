@@ -1007,12 +1007,25 @@ static void inst(Ctx* c, u32 idx, u64 w, const Op* op){
     else {
       const char* cc=crd; int dc_comb= dc && !(dim==3 && array);
       if(dc) cc= dc_comb? T("vec%d(%s, %s)",dim+array+1,crd,dref) : crd;
-      if(lod) smp= dc? T("vec4(textureLod(tex%d, %s, %s))",s,cc,lod) : T("textureLod(tex%d, %s, %s)",s,cc,lod);
+      /* chain the sampling emission off ONE if/else: the old string attached the trailing else-if(bias)/else
+         pair to the textureGrad special-case below it, so any explicit-lod TEX (lod!=0, no shadow) took the
+         final else and the textureLod assignment was overwritten with an implicit texture() call. verified
+         against emitted GLSL: 25 dumped fragment shaders contained 0 textureLod( calls with TEX.L still present.
+         texture(...,bias) only exists in the fragment stage: in other stages a TEX.B (bias, even a literal 0)
+         is illegal GLSL and the vertex shader failed to compile, so non-fragment stages emit
+         textureLod(tex,cc,0.0) (same shape as explicit-lod 0.0 in SPIR-V). */
+      if(c->stage==ST_FS){
+        if(lod) smp= dc? T("vec4(textureLod(tex%d, %s, %s))",s,cc,lod) : T("textureLod(tex%d, %s, %s)",s,cc,lod);
+        else if(bias) smp= dc? T("vec4(texture(tex%d, %s, %s))",s,cc,bias) : T("texture(tex%d, %s, %s)",s,cc,bias);
+        else smp= dc? (dc_comb? T("vec4(texture(tex%d, %s))",s,cc) : T("vec4(texture(tex%d, %s, %s))",s,cc,dref)) : T("texture(tex%d, %s)",s,cc);
+      } else {
+        if(lod) smp= dc? T("vec4(textureLod(tex%d, %s, %s))",s,cc,lod) : T("textureLod(tex%d, %s, %s)",s,cc,lod);
+        else smp= dc? (dc_comb? T("vec4(texture(tex%d, %s))",s,cc) : T("vec4(texture(tex%d, %s, %s))",s,cc,dref))
+                    : T("textureLod(tex%d, %s, 0.0)",s,cc);
+      }
       /* textureLod on 2D array / cube shadow samplers needs GL_EXT_texture_shadow_lod (nvidia takes it anyway,
          intel and AMD reject the shader). shadow maps have one level and zero gradients pick that same one */
       if(lod && dc && dc_comb && (array || dim==3)) smp=T("vec4(textureGrad(tex%d, %s, vec%d(0.0), vec%d(0.0)))",s,cc,dim,dim);
-      else if(bias) smp= dc? T("vec4(texture(tex%d, %s, %s))",s,cc,bias) : T("texture(tex%d, %s, %s)",s,cc,bias);
-      else smp= dc? (dc_comb? T("vec4(texture(tex%d, %s))",s,cc) : T("vec4(texture(tex%d, %s, %s))",s,cc,dref)) : T("texture(tex%d, %s)",s,cc);
       /* offset from a register. GLSL wants a constant expression here, nvidia lets it slide but AMD/mesa reject
          the shader. when the driver says no (g_texoff_emul, see gl_selftest) we add it to the coord in level 0
          texels */
