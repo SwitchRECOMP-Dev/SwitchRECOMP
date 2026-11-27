@@ -202,6 +202,7 @@ typedef struct Tex {
   GLuint id; u64 hash; int is_rt, gpu_written; u32 frame_checked, last_used; GLint swz[4]; u64 tr_last; u32 stable, next_check; GLuint view; GLenum view_target; GLint vswz[4]; u32 wgen, crop_gen; u64 wfs; u32 wframe; struct Tex* crop; struct Tex* lay; struct Tex* vol; int skipclr, zero3d; u64 alias; u64 shash; u32 tfull;
   GLuint zc; u64 zc_hash; u32 zc_wgen, zc_ok;   /* depth copy for shadow samplers (zc_ok: 1 made, 2 failed) */
   u64* seen; u32 nseen;   /* assembled textures: which RT (and write count) each layer/level was copied from */
+  u8* filled;             /* assembled textures: content per layer/level = 1 copied from a real RT, 2 box-generated */
   struct RtHist* hist; u32 nhist;   /* last draws into this RT (small RTs only), for F5 traces */
   struct Tex* next;
 } Tex;
@@ -230,7 +231,7 @@ static u64 g_tm[TM_N], g_tmp[TM_N]; static u64 st_sh_new;
 static GLuint shadow_depth_copy(Tex* t){
   if(t->zc_ok==2) return 0;
   if(t->target!=GL_TEXTURE_2D || t->f.depth || t->f.is_int || t->f.compressed) return 0;
-  if(t->f.ifmt!=GL_R32F && t->f.ifmt!=GL_R16F && t->f.ifmt!=GL_R16) return 0;
+  if(t->f.ifmt!=GL_R32F && t->f.ifmt!=GL_R16F && t->f.ifmt!=GL_R16 && t->f.ifmt!=GL_R8) return 0;   /* games emit their shadow output as R8 normalized depths */
   if(t->is_rt && (u64)t->w*t->h>512u*512u){ t->zc_ok=2; return 0; }   /* a big render target would need a readback every frame */
   if(t->zc && t->zc_hash==t->hash && t->zc_wgen==t->wgen) return t->zc;
   u64 n=(u64)t->w*t->h; float* px=malloc(n*4); if(!px){ t->zc_ok=2; return 0; }
@@ -242,7 +243,7 @@ static GLuint shadow_depth_copy(Tex* t){
   glPixelStorei(GL_UNPACK_ALIGNMENT,1); glPixelStorei(GL_UNPACK_ROW_LENGTH,0);
   glTexSubImage2D(GL_TEXTURE_2D,0,0,0,t->w,t->h,GL_DEPTH_COMPONENT,GL_FLOAT,px); free(px);
   t->zc_hash=t->hash; t->zc_wgen=t->wgen; t->zc_ok=1;
-  { static int said; if(said<4){ said++; LOG("gpu: %ux%u %s %s read by a shadow sampler: using a depth copy\n",t->w,t->h,t->f.ifmt==GL_R32F? "R32F" : "R16",t->is_rt? "render target" : "texture"); } }
+  { static int said; if(said<4){ said++; LOG("gpu: %ux%u %s %s read by a shadow sampler: using a depth copy\n",t->w,t->h,t->f.ifmt==GL_R32F? "R32F" : t->f.ifmt==GL_R8? "R8" : "R16",t->is_rt? "render target" : "texture"); } }
   return t->zc; }
 
 /* full size of a bl texture, all layers and mips */
@@ -557,7 +558,7 @@ static Tex* layered_from_rts(Tex* rt0, u64 gva, u32 w, u32 h, u32 d, u32 levels,
   if(d>1){ u64 al=512ull<<bh; lsz=(lsz+al-1)/al*al; }
   Tex* c=rt0->lay;
   if(c && (c->w!=w || c->h!=h || c->d!=d || c->levels!=levels || c->target!=target || c->fkey!=rt0->fkey)){
-    glDeleteTextures(1,&c->id); if(c->view) glDeleteTextures(1,&c->view); free(c->seen); free(c); c=rt0->lay=NULL; g_fb_sig_ok=0; g_tmap_gen++; }
+    glDeleteTextures(1,&c->id); if(c->view) glDeleteTextures(1,&c->view); free(c->seen); free(c->filled); free(c); c=rt0->lay=NULL; g_fb_sig_ok=0; g_tmap_gen++; }
   u32 W0=TD(rt0,w), H0=TD(rt0,h);
   if(!c){ g_tmap_gen++; c=calloc(1,sizeof *c); c->gva=gva; c->w=w; c->h=h; c->d=d; c->levels=levels; c->target=target; c->f=rt0->f; c->fkey=rt0->fkey; c->is_rt=1; c->scale=TS(rt0); c->bl=1; c->bh=bh;
     c->swz[0]=GL_RED; c->swz[1]=GL_GREEN; c->swz[2]=GL_BLUE; c->swz[3]=GL_ALPHA;
@@ -572,35 +573,50 @@ static Tex* layered_from_rts(Tex* rt0, u64 gva, u32 w, u32 h, u32 d, u32 levels,
     mb_reset();
     static int said; if(said<6){ said++; LOG("gpu: %s %ux%u (%u layers, %u mips) assembled from its render targets (%llx)\n",target==GL_TEXTURE_CUBE_MAP? "cubemap":target==GL_TEXTURE_2D? "mip chain":"array",w,h,d,levels,(unsigned long long)gva); } }
   /* signature: which RTs exist and their write counters */
-  u32 sig=2166136261u; int maxl=-1;
+  u32 sig=2166136261u;
   /* arrays and cube arrays can get filled a piece at a time: wonder renders the first cube of its sky cube array
      and builds its mips (sampling the array) before the second cube exists, so we use the layers that are there
      instead of dropping the whole texture */
   u8 have[256]; int part= (target==GL_TEXTURE_2D_ARRAY || target==GL_TEXTURE_CUBE_MAP_ARRAY) && d<=256;
   for(u32 y=0;y<d && y<256;y++) have[y]=1;
   if(part) for(u32 y=1;y<d;y++){ Tex* r=tex_find_rt(gva+(u64)y*lsz); have[y]= r && r->target==GL_TEXTURE_2D && rt_w_fits(r,w) && r->h==h && r->f.ifmt==rt0->f.ifmt; }
-  for(u32 l=0;l<levels;l++){ int all=1;
-    for(u32 y=0;y<d;y++){ if(part && !have[y]) continue;
-      Tex* r=tex_find_rt(gva+(u64)y*lsz+loff[l]); u32 lw=w>>l, lh=h>>l; if(!lw) lw=1; if(!lh) lh=1;
+  /* presence is tracked PER (level,face): the game builds every cube's mips in successive passes (sampling the
+     array), and while cube 2 already has its level 0 but not yet its mips, a single global maxl collapsed to 0
+     and level generation overwrote the real mips of cube 1 that were already copied. a (level,face) with a real
+     RT gets copied and marked filled=1; generation only fills holes (filled!=1) and never touches a slot backed
+     by a real RT; a real RT arriving later on a generated slot still wins (seen is reset for it). */
+  static u8 *okb, *tchb; static u32 okn; u32 ns2=(u32)levels*d;
+  if(okn<ns2){ free(okb); free(tchb); okb=calloc(ns2,1); tchb=calloc(ns2,1); okn= (okb&&tchb)? ns2 : 0; }
+  u8* ok=okb, *tch=tchb; if(!ok || !tch) return NULL;
+  memset(tch,0,ns2);
+  for(u32 l=0;l<levels;l++) for(u32 y=0;y<d;y++){
+    u8 o=0; u32 lw=w>>l, lh=h>>l; if(!lw) lw=1; if(!lh) lh=1;
+    if(!(part && (y>=256 || !have[y]))){
+      Tex* r=tex_find_rt(gva+(u64)y*lsz+loff[l]);
       /* tiny mips get rendered into RTs padded to a GOB row (64 bytes), like 8x4 / 8x2 for the 4x4 / 2x2 mips of
          an RGBA16F chain */
       u32 gobpx= rt0->f.bpp? 64u/rt0->f.bpp : 16u; if(!gobpx) gobpx=1;
-      if(r && r->target==GL_TEXTURE_2D && (rt_w_fits(r,lw) || (l>0 && r->w>=lw && (r->w<lw*2 || r->w<=gobpx))) && (r->h==lh || (l>0 && r->h>=lh && r->h<lh*2)) && r->f.ifmt==rt0->f.ifmt){ sig=(sig^(r->wgen+y*31+l*977))*16777619u; sig=(sig^(u32)(uintptr_t)r)*16777619u; } else all=0; }
-    if(!all) break; maxl=(int)l; }
-  if(getenv("SWR_LAYDBG")){ static int n; if(n<3){ n++; LOG("laydbg gva=%llx lsz=%llx bh=%u levels=%u maxl=%d\n",(unsigned long long)gva,(unsigned long long)lsz,bh,levels,maxl);
+      if(r && r->target==GL_TEXTURE_2D && (rt_w_fits(r,lw) || (l>0 && r->w>=lw && (r->w<lw*2 || r->w<=gobpx))) && (r->h==lh || (l>0 && r->h>=lh && r->h<lh*2)) && r->f.ifmt==rt0->f.ifmt){ o=1; sig=(sig^(r->wgen+y*31+l*977))*16777619u; sig=(sig^(u32)(uintptr_t)r)*16777619u; } }
+    ok[l*d+y]=o; }
+  if(getenv("SWR_LAYDBG")){ static int n; if(n<3){ n++; int f0=0; for(u32 y=0;y<d;y++) if(ok[y]) f0++;
+      LOG("laydbg gva=%llx lsz=%llx bh=%u levels=%u faces_l0=%d maxlf=",(unsigned long long)gva,(unsigned long long)lsz,bh,levels,f0);
+      for(u32 y=0;y<d;y++){ int m=-1; for(int l=(int)levels-1;l>=0;l--) if(ok[l*d+y]){ m=l; break; } LOG("%d%s",m, y+1<d? ",":"\n"); }
       for(u32 l=0;l<levels;l++) for(u32 y=0;y<d;y++){ u64 a=gva+(u64)y*lsz+loff[l]; Tex* r=tex_find_rt(a); LOG("  l%u c%u %llx -> %s %ux%u\n",l,y,(unsigned long long)a,r?"rt":"-",r?r->w:0,r?r->h:0); }
       for(int k=0;k<TEXH;k++) for(Tex* r=texh[k];r;r=r->next) if(r->is_rt && r->w<=64 && r->h<=64) LOG("  RT %llx %ux%u\n",(unsigned long long)r->gva,r->w,r->h); } }
-  if(maxl<0) return NULL;   /* missing faces -> normal path */
+  { int bad=0; for(u32 y=0;y<d;y++){ if(part && (y>=256 || !have[y])) continue; if(!ok[y]) bad=1; }
+    if(bad) return NULL; }   /* level 0 missing on a live face -> normal path */
   if(c->crop_gen!=sig){
     int col=!rt0->f.depth && !rt0->f.is_int;
     /* only the layers/levels whose RT changed get copied. tomodachi rebuilds one face of a 72 layer cube array a
        level at a time and samples the array for every next level, copying all 576 pieces each time was ~10 ms per
        pass and 200 ms a frame on an intel iGPU */
-    u32 ns=levels*d; if(c->nseen!=ns){ free(c->seen); c->seen=calloc(ns,sizeof(u64)); c->nseen= c->seen? ns : 0; }
+    u32 ns=levels*d; if(c->nseen!=ns){ free(c->seen); free(c->filled); c->seen=calloc(ns,sizeof(u64)); c->filled=calloc(ns,1); c->nseen= (c->seen && c->filled)? ns : 0; }
     for(int pass=0;pass<2;pass++){
       if(pass && c->seen) memset(c->seen,0,sizeof(u64)*c->nseen);   /* copies switched to blits: redo all of it */
-      for(int l=0;l<=maxl;l++) for(u32 y=0;y<d;y++){ if(part && !have[y]) continue; Tex* r=tex_find_rt(gva+(u64)y*lsz+loff[l]);
-        if(c->seen){ u64 key=((u64)r->wgen<<40)^(u64)(uintptr_t)r^1; u64* sl=&c->seen[(u32)l*d+y]; if(*sl==key) continue; *sl=key; }
+      for(u32 l=0;l<levels;l++) for(u32 y=0;y<d;y++){ if(!ok[l*d+y]) continue; Tex* r=tex_find_rt(gva+(u64)y*lsz+loff[l]); if(!r) continue;
+        if(c->seen){ u64 key=((u64)r->wgen<<40)^(u64)(uintptr_t)r^1; u64* sl=&c->seen[l*d+y]; if(*sl==key) continue; *sl=key; }
+        if(c->filled) c->filled[l*d+y]=1;
+        tch[l*d+y]=1;
         u32 cw=W0>>l, ch=H0>>l; if(!cw) cw=1; if(!ch) ch=1;
         if(TS(r)!=TS(c)){
           u32 lw=w>>l, lh=h>>l; if(!lw) lw=1; if(!lh) lh=1;
@@ -612,8 +628,8 @@ static Tex* layered_from_rts(Tex* rt0, u64 gva, u32 w, u32 h, u32 d, u32 levels,
         } }
       /* check the first few chains: the center of level 1 has to match its source RT. if the driver dropped the
          copy we switch to blits for good */
-      static int nchk; if(pass || g_lvl_mode || !col || maxl<1 || nchk>=6) break;
-      { Tex* r1=tex_find_rt(gva+loff[1]); if(r1 && TS(r1)!=TS(c)) break; } nchk++;
+      static int nchk; if(pass || g_lvl_mode || !col || levels<2 || !ok[1*d+0] || nchk>=6) break;
+      { Tex* r1=tex_find_rt(gva+loff[1]); if(!r1 || TS(r1)!=TS(c)) break; } nchk++;
       Tex* r1=tex_find_rt(gva+loff[1]); u32 cw=W0>>1, ch=H0>>1; u32 rw=TW(r1), rh=TH(r1); if(rw<cw) cw=rw; if(rh<ch) ch=rh; if(!cw || !ch) break;
       float a4[4]={0}, b4[4]={0}; GLint px=(GLint)cw/2, py=(GLint)ch/2;
       lvl_read1(r1->id,GL_TEXTURE_2D,0,0,px,py,a4); lvl_read1(c->id,target,1,0,px,py,b4);
@@ -624,11 +640,29 @@ static Tex* layered_from_rts(Tex* rt0, u64 gva, u32 w, u32 h, u32 d, u32 levels,
        5 (diffuse) and roughness*5 (spec, RGBM), with only level 0 those get the sharp image. a box chain isn't the
        game's prefilter but it's way closer than nothing. cube arrays too: frontiers' sky cubemap is one, and its
        lighting reads the upper levels */
-    int topl=maxl; static int nogen=-1; if(nogen<0) nogen=getenv("SWR_NO_CUBE_MIPGEN")!=NULL;
-    if(maxl<(int)levels-1 && !nogen && !rt0->f.is_int && !rt0->f.depth && (target==GL_TEXTURE_CUBE_MAP || target==GL_TEXTURE_CUBE_MAP_ARRAY || target==GL_TEXTURE_2D_ARRAY || target==GL_TEXTURE_2D)){
-      lvl_gen(c->id,target,maxl,(int)levels,d,W0,H0); topl=(int)levels-1; mb_reset();
-      if(c->seen) for(u32 l=(u32)maxl+1;l<levels;l++) memset(c->seen+l*d,0,sizeof(u64)*d);   /* generated now, a real RT there later has to be copied again */
-      static int said; if(said<8){ said++; LOG("gpu: %s %ux%u at %llx: %d of %u mips rendered by the game, the rest generated\n",target==GL_TEXTURE_CUBE_MAP? "cubemap":target==GL_TEXTURE_2D? "mip chain":"array",w,h,(unsigned long long)gva,maxl+1,levels); } }
+    static int nogen=-1; if(nogen<0) nogen=getenv("SWR_NO_CUBE_MIPGEN")!=NULL;
+    int nreal=0, ngen=0;
+    /* holes (levels the game hasn't rendered yet on that face) get box-generated from the level above, PER FACE
+       and only into slots never filled from a real RT (filled!=1). a generated chain refreshes when its source
+       content is copied or regenerated in this pass (tch), so a re-rendered level 0 rebuilds its own chain while
+       untouched chains are left alone (the game resamples the array while building, so stale refreshes used to
+       stomp over real content that arrived out of order). */
+    if(!nogen && !rt0->f.is_int && !rt0->f.depth && (target==GL_TEXTURE_CUBE_MAP || target==GL_TEXTURE_CUBE_MAP_ARRAY || target==GL_TEXTURE_2D_ARRAY || target==GL_TEXTURE_2D) && c->filled){
+      for(u32 y=0;y<d;y++){
+        if(part && (y>=256 || !have[y])) continue;
+        for(u32 l=1;l<levels;l++){ u32 i=l*d+y, s=(l-1)*d+y;
+          if(c->filled[i]==1) continue;             /* a real render always wins */
+          if(!c->filled[s]) continue;               /* no source content to box down from */
+          if(c->filled[i]==2 && !tch[s]) continue;  /* generated earlier and its source is unchanged: keep it */
+          u32 sw2=W0>>(l-1), sh2=H0>>(l-1), dw2=W0>>l, dh2=H0>>l; if(!sw2) sw2=1; if(!sh2) sh2=1; if(!dw2) dw2=1; if(!dh2) dh2=1;
+          lvl_blit(c->id,target,(int)(l-1),(int)y,(GLsizei)sw2,(GLsizei)sh2,c->id,target,(int)l,(int)y,(GLsizei)dw2,(GLsizei)dh2,GL_LINEAR);
+          c->filled[i]=2; tch[i]=1; if(c->seen) c->seen[i]=0;   /* generated now, a real RT there later has to be copied again */
+          ngen++; } }
+      if(ngen) mb_reset(); }
+    int topl=0;
+    if(c->filled) for(u32 i=0;i<(u32)(levels*d);i++){ if(!c->filled[i]) continue; if((int)(i/d)>topl) topl=(int)(i/d); if(c->filled[i]==1) nreal++; }
+    { static int said; if(said<8 && ngen){ said++;
+        LOG("gpu: %s %ux%u at %llx: %d of %u mip-slots rendered by the game, %d generated\n",target==GL_TEXTURE_CUBE_MAP? "cubemap":target==GL_TEXTURE_2D? "mip chain":"array",w,h,(unsigned long long)gva,nreal,levels*d,ngen); } }
     if((int)c->stable!=topl){ glBindTexture(target,c->id); glTexParameteri(target,GL_TEXTURE_MAX_LEVEL,topl); c->stable=(u32)topl; mb_reset(); }
     c->crop_gen=sig; st_lay_copy++; }
   c->last_used=g_frame; rt0->last_used=g_frame; return c; }
@@ -2141,7 +2175,7 @@ static void bind_textures(GpuChannel* ch, int stage, Sh* s){
     /* the shader's sampler type wins */
     GLenum want= st->type==2? GL_TEXTURE_3D : st->type==3? (st->array? GL_TEXTURE_CUBE_MAP_ARRAY : GL_TEXTURE_CUBE_MAP) : st->array? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D;
     tids[i]=0;
-    GLuint zc_id= (st->shadow && t && want==GL_TEXTURE_2D && !t->f.depth)? shadow_depth_copy(t) : 0;
+    GLuint zc_id= ((st->shadow || ((tsc[0]>>9)&1)) && t && want==GL_TEXTURE_2D && !t->f.depth)? shadow_depth_copy(t) : 0;   /* the game's TSC compare bit (bit9) also declares compare, beyond what shader reflection reports */
     if(zc_id){ if(mb) tids[i]=zc_id; else glBindTexture(want,zc_id); st_tex_ok++; g_tex_any_ok=1; }
     else if(t && t->target==want && !(want==GL_TEXTURE_3D && t->zero3d && !t->is_rt)){ if(mb) tids[i]=t->id; else glBindTexture(want,t->id); if(t->is_rt) st_tex_rt++; else st_tex_ok++; g_tex_any_ok=1;
       if(want==GL_TEXTURE_3D){ static u64 seen3[16]; static int n3; int k=0; for(;k<n3;k++) if(seen3[k]==t->gva) break;
@@ -2187,8 +2221,10 @@ static void bind_textures(GpuChannel* ch, int stage, Sh* s){
     /* sRGB storage read through a non-sRGB TIC gives raw values on hw. in GL the sampler's SRGB_DECODE wins over
        the texture's, so it's a sampler flag (tsc[7] bit 31) */
     int srgb_raw= t && t->f.ifmt==GL_SRGB8_ALPHA8 && !((tic[4]>>22)&1);
-    /* compare mode comes from the shader's sampler type, a non-shadow sampler with compare on reads 0 in GL */
-    if(st->shadow){ if(!((tsc[0]>>9)&1)){ tsc[0]|=1u<<9; tsc[0]=(tsc[0]&~(7u<<10))|(3u<<10); } } else tsc[0]&=~(1u<<9);
+    /* compare mode comes from the shader's sampler type, a non-shadow sampler with compare on reads 0 in GL.
+       the game's TSC compare field is the NVN enum+1, so a raw 0 is LEQUAL (3): NEVER never matches the
+       (1-s) comparison the shading does on the copied depths. respect a compare bit the reflection missed */
+    if(st->shadow || ((tsc[0]>>9)&1)){ if(!((tsc[0]>>9)&1)){ tsc[0]|=1u<<9; tsc[0]=(tsc[0]&~(7u<<10))|(3u<<10); } else if(((tsc[0]>>10)&7)==0){ tsc[0]=(tsc[0]&~(7u<<10))|(3u<<10); } } else tsc[0]&=~(1u<<9);
     if(t && t->f.is_int) tsc[1]=(tsc[1]&~0xF3u)|0x51u;   /* int textures must be NEAREST, LINEAR makes them incomplete */
     if(srgb_raw) tsc[7]|=0x80000000u;
     if(mb) sids[i]=sampler_get(tsc); else glBindSampler(unit,sampler_get(tsc));
