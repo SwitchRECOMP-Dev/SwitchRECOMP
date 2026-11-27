@@ -333,6 +333,7 @@ static void astc_rows(void* c, u32 a, u32 b){ DecJob* j=c; astc_decode_rows(j->s
 static void bc_rows(void* c, u32 a, u32 b){ DecJob* j=c; u32 bx=(j->w+3)/4; u32 y0=a*4, y1=b*4; if(y1>j->h) y1=j->h; if(y0>=y1) return;
   swr_bc_decode((int)j->kind,j->src+(u64)a*bx*j->bsz,j->w,y1-y0,(u32*)(j->dst+(u64)y0*j->w*4)); }
 
+static int g_fb_sig_ok;   /* forward: defined with the RT-assembly helpers below; tex_upload invalidates it */
 static void tex_upload(Tex* t){ st_tex_up+=t->size;
   if(tex_zero_height_fix(t)) return;
   const GlFmt* f=&t->f;
@@ -396,6 +397,11 @@ static void tex_upload(Tex* t){ st_tex_up+=t->size;
       off+= t->bl? lsz : (u64)t->pitch*th;
     }
   }
+  /* the texture view (the 2D->2D_ARRAY fallback built in tex_view) is derived data: a re-upload from
+     guest memory (glyph tiles rasterized later into the same font sheet) would leave the view showing
+     the old pixels. drop it so the next bind rebuilds it, exactly like tex_view does when replacing
+     an existing view */
+  if(t->view){ glDeleteTextures(1,&t->view); t->view=0; g_fb_sig_ok=0; }
 }
 
 static u32 g_tex_bud_frame; static i64 g_tex_bud; static u64 st_tex_chk;
@@ -411,9 +417,16 @@ static u64 fast_hash(const u8* p, u64 size, int sampled){
 static u64 sample_hash(u64 gva, u64 len); static int g_nosample;
 
 static u64 mem_hash(u64 gva, u64 size){
-  /* quick sample: one word per 64 bytes + the first 4K */
-  u64 h=1469598103934665603ull; u8* p=gmem_ptr(gva,size);
-  if(p) return fast_hash(p,size,1);
+  /* quick sample: one word per 64 bytes + the first 4K. small writes that land between sample words
+     (glyph tiles rasterized into a font sheet while the texture is already live) never move the
+     hash, so the texture is never re-uploaded: guest memory has the new pixels and the GL copy keeps
+     serving the old sheet. identity-hash textures up to 32 MB in full: the full run happens on
+     creation, on change checks while a texture is unstable, and under the existing per-frame check
+     budget; long-stable big textures keep the cheap sampled short-circuit */
+  u64 h=1469598103934665603ull; int full= size<=(32ull<<20);
+  u8* p=gmem_ptr(gva,size);
+  if(p) return fast_hash(p,size, full? 0 : 1);
+  if(full){ u8* b=malloc(size? size : 1); if(b){ gmem_read(gva,b,size); u64 hh=fast_hash(b,size,0); free(b); return hh; } }
   for(u64 o=0;o<size;o+=4096){ u64 v[8]; gmem_read(gva+o,v,size-o<64? size-o : 64); for(int i=0;i<8;i++){ h^=v[i]; h*=1099511628211ull; } }
   return h; }
 
@@ -2012,7 +2025,39 @@ static GLuint tex_view(Tex* t, GLenum want){
   if(t->f.fmt==0 && !t->f.compressed) return 0;
   if(t->view){ glDeleteTextures(1,&t->view); t->view=0; g_fb_sig_ok=0; }
   GLuint v=0; glGenTextures(1,&v); p_tview(v,want,t->id,t->f.ifmt,0,t->levels,0,nl);
-  if(glGetError()!=GL_NO_ERROR){ glDeleteTextures(1,&v); return 0; }
+  GLenum v_err=glGetError();
+  if(v_err!=GL_NO_ERROR){
+    /* some drivers reject glTextureView for 2D->2D_ARRAY on unpacked formats (seen on windows/AMD
+       Radeon GL: the view comes back GL_INVALID_VALUE and the sampler stays unbound, so every draw
+       that samples the texture is skipped as a type mismatch). build a real 2D_ARRAY texture and
+       copy the pixels instead, which is always legal (unpacked formats only: compressed ones still
+       depend on the view). */
+    glDeleteTextures(1,&v); v=0;
+    if(a==GL_TEXTURE_2D && want==GL_TEXTURE_2D_ARRAY && t->f.ifmt && !t->f.compressed && p_cis){
+      static int said; int ncpy=0;
+      int lvl= t->levels>=1? (int)t->levels : 1;
+      glGenTextures(1,&v); glBindTexture(GL_TEXTURE_2D_ARRAY,v);
+      glTexStorage3D(GL_TEXTURE_2D_ARRAY,lvl,t->f.ifmt,t->w,t->h,1);
+      if(glGetError()!=GL_NO_ERROR){ glDeleteTextures(1,&v); v=0; }
+      else for(int l=0;l<lvl;l++){
+        int w2= (t->w>>l)? (int)(t->w>>l) : 1, h2= (t->h>>l)? (int)(t->h>>l) : 1;
+        /* level 0 is a bit-exact CopyImageSubData (legal everywhere); later levels switch to the
+           selftest-verified blit path once the driver has shown its CopyImageSubData is unreliable */
+        if(l>0 && g_lvl_mode) lvl_blit(t->id,GL_TEXTURE_2D,l,0,w2,h2,v,GL_TEXTURE_2D_ARRAY,l,0,w2,h2,GL_NEAREST);
+        else p_cis(t->id,GL_TEXTURE_2D,l,0,0,0,v,GL_TEXTURE_2D_ARRAY,l,0,0,0,w2,h2,1);
+        if(glGetError()!=GL_NO_ERROR){ LOG("gpu: view fallback: level %d/%d copy failed: back to 1-mip\n",l,lvl);
+          glDeleteTextures(1,&v); v=0;
+          glGenTextures(1,&v); glBindTexture(GL_TEXTURE_2D_ARRAY,v);
+          glTexStorage3D(GL_TEXTURE_2D_ARRAY,1,t->f.ifmt,t->w,t->h,1);
+          glTexParameteri(GL_TEXTURE_2D_ARRAY,GL_TEXTURE_MAX_LEVEL,0);   /* keep a 1-level texture mipmap-complete */
+          p_cis(t->id,GL_TEXTURE_2D,0,0,0,0,v,GL_TEXTURE_2D_ARRAY,0,0,0,0,t->w,t->h,1);
+          if(glGetError()!=GL_NO_ERROR){ glDeleteTextures(1,&v); v=0; }
+          break; }
+        ncpy++; }
+      if(v && ncpy==lvl && said<4){ said++; LOG("gpu: view 2D->2D_ARRAY rejected (err %x): using copy fallback (%d mips)\n",v_err,lvl); }
+    }
+    if(!v) return 0;
+  }
   t->view=v; t->view_target=want; st_tex_view++;
   t->vswz[0]=GL_RED; t->vswz[1]=GL_GREEN; t->vswz[2]=GL_BLUE; t->vswz[3]=GL_ALPHA;
   return v; }
